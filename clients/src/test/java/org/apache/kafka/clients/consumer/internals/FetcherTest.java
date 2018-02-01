@@ -32,6 +32,7 @@ import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.MetricNameTemplate;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
@@ -43,6 +44,7 @@ import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.network.NetworkReceive;
@@ -75,6 +77,7 @@ import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.utils.ByteBufferOutputStream;
+import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.test.DelayedReceive;
@@ -106,6 +109,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+@SuppressWarnings("deprecation")
 public class FetcherTest {
     private ConsumerRebalanceListener listener = new NoOpConsumerRebalanceListener();
     private String topicName = "test";
@@ -129,7 +133,8 @@ public class FetcherTest {
     private SubscriptionState subscriptions = new SubscriptionState(OffsetResetStrategy.EARLIEST);
     private SubscriptionState subscriptionsNoAutoReset = new SubscriptionState(OffsetResetStrategy.NONE);
     private static final double EPSILON = 0.0001;
-    private ConsumerNetworkClient consumerClient = new ConsumerNetworkClient(client, metadata, time, 100, 1000);
+    private ConsumerNetworkClient consumerClient = new ConsumerNetworkClient(new LogContext(),
+            client, metadata, time, 100, 1000, Integer.MAX_VALUE);
 
     private MemoryRecords records;
     private MemoryRecords nextRecords;
@@ -265,7 +270,7 @@ public class FetcherTest {
             public byte[] deserialize(String topic, byte[] data) {
                 if (i++ % 2 == 1) {
                     // Should be blocked on the value deserialization of the first record.
-                    assertEquals(new String(data, StandardCharsets.UTF_8), "value-1");
+                    assertEquals("value-1", new String(data, StandardCharsets.UTF_8));
                     throw new SerializationException();
                 }
                 return data;
@@ -294,7 +299,7 @@ public class FetcherTest {
     }
 
     @Test
-    public void testParseInvalidRecord() throws Exception {
+    public void testParseCorruptedRecord() throws Exception {
         ByteBuffer buffer = ByteBuffer.allocate(1024);
         DataOutputStream out = new DataOutputStream(new ByteBufferOutputStream(buffer));
 
@@ -323,6 +328,15 @@ public class FetcherTest {
         out.writeInt(size);
         LegacyRecord.write(out, magic, crc, LegacyRecord.computeAttributes(magic, CompressionType.NONE, TimestampType.CREATE_TIME), timestamp, key, value);
 
+        // Write a record whose size field is invalid.
+        out.writeLong(offset + 3);
+        out.writeInt(1);
+
+        // write one valid record
+        out.writeLong(offset + 4);
+        out.writeInt(size);
+        LegacyRecord.write(out, magic, crc, LegacyRecord.computeAttributes(magic, CompressionType.NONE, TimestampType.CREATE_TIME), timestamp, key, value);
+
         buffer.flip();
 
         subscriptions.assignFromUser(singleton(tp0));
@@ -337,28 +351,44 @@ public class FetcherTest {
         assertEquals(1, fetcher.fetchedRecords().get(tp0).size());
         assertEquals(1, subscriptions.position(tp0).longValue());
 
-        // the fetchedRecords() should always throw exception due to the second invalid message
+        ensureBlockOnRecord(1L);
+        seekAndConsumeRecord(buffer, 2L);
+        ensureBlockOnRecord(3L);
+        try {
+            // For a record that cannot be retrieved from the iterator, we cannot seek over it within the batch.
+            seekAndConsumeRecord(buffer, 4L);
+            fail("Should have thrown exception when fail to retrieve a record from iterator.");
+        } catch (KafkaException ke) {
+           // let it go
+        }
+        ensureBlockOnRecord(4L);
+    }
+
+    private void ensureBlockOnRecord(long blockedOffset) {
+        // the fetchedRecords() should always throw exception due to the invalid message at the starting offset.
         for (int i = 0; i < 2; i++) {
             try {
                 fetcher.fetchedRecords();
                 fail("fetchedRecords should have raised KafkaException");
             } catch (KafkaException e) {
-                assertEquals(1, subscriptions.position(tp0).longValue());
+                assertEquals(blockedOffset, subscriptions.position(tp0).longValue());
             }
         }
+    }
 
+    private void seekAndConsumeRecord(ByteBuffer responseBuffer, long toOffset) {
         // Seek to skip the bad record and fetch again.
-        subscriptions.seek(tp0, 2);
+        subscriptions.seek(tp0, toOffset);
         // Should not throw exception after the seek.
         fetcher.fetchedRecords();
         assertEquals(1, fetcher.sendFetches());
-        client.prepareResponse(fetchResponse(tp0, MemoryRecords.readableRecords(buffer), Errors.NONE, 100L, 0));
+        client.prepareResponse(fetchResponse(tp0, MemoryRecords.readableRecords(responseBuffer), Errors.NONE, 100L, 0));
         consumerClient.poll(0);
 
         List<ConsumerRecord<byte[], byte[]>> records = fetcher.fetchedRecords().get(tp0);
         assertEquals(1, records.size());
-        assertEquals(2L, records.get(0).offset());
-        assertEquals(3, subscriptions.position(tp0).longValue());
+        assertEquals(toOffset, records.get(0).offset());
+        assertEquals(toOffset + 1, subscriptions.position(tp0).longValue());
     }
 
     @Test
@@ -1102,7 +1132,7 @@ public class FetcherTest {
         Node node = cluster.nodes().get(0);
         NetworkClient client = new NetworkClient(selector, metadata, "mock", Integer.MAX_VALUE,
                 1000, 1000, 64 * 1024, 64 * 1024, 1000,
-                time, true, new ApiVersions(), throttleTimeSensor);
+                time, true, new ApiVersions(), throttleTimeSensor, new LogContext());
 
         short apiVersionsResponseVersion = ApiKeys.API_VERSIONS.latestVersion();
         ByteBuffer buffer = ApiVersionsResponse.createApiVersionsResponse(400, RecordBatch.CURRENT_MAGIC_VALUE).serialize(apiVersionsResponseVersion, new ResponseHeader(0));
@@ -1141,7 +1171,10 @@ public class FetcherTest {
         subscriptions.seek(tp0, 0);
 
         MetricName maxLagMetric = metrics.metricInstance(metricsRegistry.recordsLagMax);
-        MetricName partitionLagMetric = metrics.metricName(tp0 + ".records-lag", metricGroup);
+        Map<String, String> tags = new HashMap<>();
+        tags.put("topic", tp0.topic());
+        tags.put("partition", String.valueOf(tp0.partition()));
+        MetricName partitionLagMetric = metrics.metricName("records-lag", metricGroup, tags);
 
         Map<MetricName, KafkaMetric> allMetrics = metrics.metrics();
         KafkaMetric recordsFetchLagMax = allMetrics.get(maxLagMetric);
@@ -1180,7 +1213,12 @@ public class FetcherTest {
         subscriptions.seek(tp0, 0);
 
         MetricName maxLagMetric = metrics.metricInstance(metricsRegistry.recordsLagMax);
-        MetricName partitionLagMetric = metrics.metricName(tp0 + ".records-lag", metricGroup);
+
+        Map<String, String> tags = new HashMap<>();
+        tags.put("topic", tp0.topic());
+        tags.put("partition", String.valueOf(tp0.partition()));
+        MetricName partitionLagMetric = metrics.metricName("records-lag", metricGroup, tags);
+        MetricName partitionLagMetricDeprecated = metrics.metricName(tp0 + ".records-lag", metricGroup);
 
         Map<MetricName, KafkaMetric> allMetrics = metrics.metrics();
         KafkaMetric recordsFetchLagMax = allMetrics.get(maxLagMetric);
@@ -1195,6 +1233,9 @@ public class FetcherTest {
         KafkaMetric partitionLag = allMetrics.get(partitionLagMetric);
         assertEquals(50, partitionLag.value(), EPSILON);
 
+        KafkaMetric partitionLagDeprecated = allMetrics.get(partitionLagMetricDeprecated);
+        assertEquals(50, partitionLagDeprecated.value(), EPSILON);
+
         // recordsFetchLagMax should be lso - offset of the last message after receiving a non-empty FetchResponse
         MemoryRecordsBuilder builder = MemoryRecords.builder(ByteBuffer.allocate(1024), CompressionType.NONE,
                 TimestampType.CREATE_TIME, 0L);
@@ -1207,6 +1248,7 @@ public class FetcherTest {
         // verify de-registration of partition lag
         subscriptions.unsubscribe();
         assertFalse(allMetrics.containsKey(partitionLagMetric));
+        assertFalse(allMetrics.containsKey(partitionLagMetricDeprecated));
     }
 
     @Test
@@ -1332,6 +1374,38 @@ public class FetcherTest {
 
         assertEquals(expectedBytes, fetchSizeAverage.value(), EPSILON);
         assertEquals(3, recordsCountAverage.value(), EPSILON);
+    }
+
+    @Test
+    public void testFetcherMetricsTemplates() throws Exception {
+        metrics.close();
+        Map<String, String> clientTags = Collections.singletonMap("client-id", "clientA");
+        metrics = new Metrics(new MetricConfig().tags(clientTags));
+        metricsRegistry = new FetcherMetricsRegistry(clientTags.keySet(), "consumer" + groupId);
+        fetcher.close();
+        fetcher = createFetcher(subscriptions, metrics);
+
+        // Fetch from topic to generate topic metrics
+        subscriptions.assignFromUser(singleton(tp0));
+        subscriptions.seek(tp0, 0);
+        assertEquals(1, fetcher.sendFetches());
+        client.prepareResponse(fetchResponse(tp0, this.records, Errors.NONE, 100L, 0));
+        consumerClient.poll(0);
+        assertTrue(fetcher.hasCompletedFetches());
+        Map<TopicPartition, List<ConsumerRecord<byte[], byte[]>>> partitionRecords = fetcher.fetchedRecords();
+        assertTrue(partitionRecords.containsKey(tp0));
+
+        // Create throttle metrics
+        Fetcher.throttleTimeSensor(metrics, metricsRegistry);
+
+        // Verify that all metrics except metrics-count have registered templates
+        Set<MetricNameTemplate> allMetrics = new HashSet<>();
+        for (MetricName n : metrics.metrics().keySet()) {
+            String name = n.name().replaceAll(tp0.toString(), "{topic}-{partition}");
+            if (!n.group().equals("kafka-metrics-count"))
+                allMetrics.add(new MetricNameTemplate(name, n.group(), "", n.tags().keySet()));
+        }
+        TestUtils.checkEquals(allMetrics, new HashSet<>(metricsRegistry.getAllTemplates()), "metrics", "templates");
     }
 
     private Map<TopicPartition, List<ConsumerRecord<byte[], byte[]>>> fetchRecords(
@@ -2013,7 +2087,9 @@ public class FetcherTest {
                                                Deserializer<V> valueDeserializer,
                                                int maxPollRecords,
                                                IsolationLevel isolationLevel) {
-        return new Fetcher<>(consumerClient,
+        return new Fetcher<>(
+                new LogContext(),
+                consumerClient,
                 minBytes,
                 maxBytes,
                 maxWaitMs,

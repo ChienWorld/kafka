@@ -31,6 +31,7 @@ import org.apache.kafka.common.requests.JoinGroupRequest;
 import org.apache.kafka.common.requests.JoinGroupResponse;
 import org.apache.kafka.common.requests.SyncGroupRequest;
 import org.apache.kafka.common.requests.SyncGroupResponse;
+import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.test.TestCondition;
@@ -75,8 +76,8 @@ public class AbstractCoordinatorTest {
         this.mockClient = new MockClient(mockTime);
 
         Metadata metadata = new Metadata(100L, 60 * 60 * 1000L, true);
-        this.consumerClient = new ConsumerNetworkClient(mockClient, metadata, mockTime,
-                retryBackoffMs, REQUEST_TIMEOUT_MS);
+        this.consumerClient = new ConsumerNetworkClient(new LogContext(), mockClient, metadata, mockTime,
+                retryBackoffMs, REQUEST_TIMEOUT_MS, HEARTBEAT_INTERVAL_MS);
         Metrics metrics = new Metrics();
 
         Cluster cluster = TestUtils.singletonCluster("topic", 1);
@@ -479,7 +480,36 @@ public class AbstractCoordinatorTest {
         assertEquals(0, coordinator.onJoinCompleteInvokes);
         assertFalse(heartbeatReceived.get());
 
+        coordinator.ensureActiveGroup();
+
+        assertEquals(1, coordinator.onJoinPrepareInvokes);
+        assertEquals(1, coordinator.onJoinCompleteInvokes);
+
+        awaitFirstHeartbeat(heartbeatReceived);
+    }
+
+    @Test
+    public void testWakeupInOnJoinComplete() throws Exception {
+        setupCoordinator(RETRY_BACKOFF_MS);
+
+        coordinator.wakeupOnJoinComplete = true;
+        mockClient.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
+        mockClient.prepareResponse(joinGroupFollowerResponse(1, "memberId", "leaderId", Errors.NONE));
+        mockClient.prepareResponse(syncGroupResponse(Errors.NONE));
+        AtomicBoolean heartbeatReceived = prepareFirstHeartbeat();
+
+        try {
+            coordinator.ensureActiveGroup();
+            fail("Should have woken up from ensureActiveGroup()");
+        } catch (WakeupException e) {
+        }
+
+        assertEquals(1, coordinator.onJoinPrepareInvokes);
+        assertEquals(0, coordinator.onJoinCompleteInvokes);
+        assertFalse(heartbeatReceived.get());
+
         // the join group completes in this poll()
+        coordinator.wakeupOnJoinComplete = false;
         consumerClient.poll(0);
         coordinator.ensureActiveGroup();
 
@@ -534,12 +564,13 @@ public class AbstractCoordinatorTest {
 
         private int onJoinPrepareInvokes = 0;
         private int onJoinCompleteInvokes = 0;
+        private boolean wakeupOnJoinComplete = false;
 
         public DummyCoordinator(ConsumerNetworkClient client,
                                 Metrics metrics,
                                 Time time) {
-            super(client, GROUP_ID, REBALANCE_TIMEOUT_MS, SESSION_TIMEOUT_MS, HEARTBEAT_INTERVAL_MS, metrics,
-                  METRIC_GROUP_PREFIX, time, RETRY_BACKOFF_MS, false);
+            super(new LogContext(), client, GROUP_ID, REBALANCE_TIMEOUT_MS, SESSION_TIMEOUT_MS,
+                    HEARTBEAT_INTERVAL_MS, metrics, METRIC_GROUP_PREFIX, time, RETRY_BACKOFF_MS, false);
         }
 
         @Override
@@ -567,6 +598,8 @@ public class AbstractCoordinatorTest {
 
         @Override
         protected void onJoinComplete(int generation, String memberId, String protocol, ByteBuffer memberAssignment) {
+            if (wakeupOnJoinComplete)
+                throw new WakeupException();
             onJoinCompleteInvokes++;
         }
     }
